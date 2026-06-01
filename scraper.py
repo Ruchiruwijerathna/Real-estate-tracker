@@ -10,13 +10,13 @@ from google.oauth2.service_account import Credentials
 from firebase_admin import credentials as fire_credentials, firestore
 from playwright.async_api import async_playwright
 
-# --- CONFIGURATION INTERCEPTORS ---
+# --- GATEWAY AUTHENTICATION VAULT ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 FIREBASE_JSON_STR = os.environ.get("FIREBASE_JSON")
 GOOGLE_SHEET_URL = os.environ.get("GOOGLE_SHEET_URL")
 
-# Strict tracking criteria date
+# Strict analysis window constraint
 DATE_THRESHOLD = datetime(2026, 5, 15).date()
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -35,7 +35,7 @@ sheet = gc.open_by_url(GOOGLE_SHEET_URL).sheet1
 def extract_real_estate_data(ad_text, metadata_header):
     prompt = f"""
     You are an expert real estate market analyst in Sri Lanka. 
-    Analyze the following Facebook advertisement text along with its launch metadata header.
+    Analyze the following Facebook advertisement text along with its launch metadata header context.
     Extract the vital data points. You must convert the launch date into strict YYYY-MM-DD format.
     
     Return your output structured exactly like this template with no conversational filler text:
@@ -45,7 +45,7 @@ def extract_real_estate_data(ad_text, metadata_header):
     Price: [Extracted price or stated rate, otherwise 'Not explicitly mentioned']
     Focus: [Core strategy focus: e.g., Highway access, 10-perch blocks]
     
-    Ad Metadata Header: {metadata_header}
+    Ad Metadata Header Context: {metadata_header}
     Ad Text to analyze: {ad_text}
     """
     response = ai_client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
@@ -88,18 +88,16 @@ async def process_live_ad_elements(company_name, page_id, raw_ad_cards, target_u
         
         if not doc_snapshot.exists:
             try:
-                # 1. Ask AI to evaluate and pull normalized dates
                 ai_text, parsed_data = extract_real_estate_data(text, header)
                 
-                # 2. Check strict date threshold constraint
+                # Check target criteria threshold validation
                 extracted_date = datetime.strptime(parsed_data["Launch_Date"], "%Y-%m-%d").date()
                 if extracted_date < DATE_THRESHOLD:
-                    print(f"⏭️ Skipping older ad launched on {parsed_data['Launch_Date']} for {company_name}")
+                    print(f"File skipped: Older ad timeline context ({parsed_data['Launch_Date']}) for {company_name}")
                     continue
                 
-                # If it passes the filter, process it fully
                 current_run_hashes.add(ad_hash)
-                print(f"💥 Valid new target confirmed ({parsed_data['Launch_Date']}) for {company_name}.")
+                print(f"💥 Target validated ({parsed_data['Launch_Date']}) for {company_name}. Syncing updates...")
                 
                 doc_ref.set({
                     "company": company_name, "page_id": page_id, "raw_text": text,
@@ -111,7 +109,7 @@ async def process_live_ad_elements(company_name, page_id, raw_ad_cards, target_u
                 send_discord_alert(company_name, ai_text, 1, target_url)
                 await asyncio.sleep(5) 
             except Exception as e:
-                print(f"⚠️ Entry filtering delay: {e}.")
+                print(f"⚠️ Tracking pass anomaly: {e}.")
         else:
             current_run_hashes.add(ad_hash)
             ad_data = doc_snapshot.to_dict()
@@ -126,7 +124,10 @@ async def process_live_ad_elements(company_name, page_id, raw_ad_cards, target_u
 
 async def prune_inactive_ads(company_name, seen_hashes):
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    active_ads_in_db = db.collection('ads').where('company', '==', company_name).where('status', '==', 'active').stream()
+    # Switched to named keyword variables to resolve Python SDK filter warnings completely
+    active_ads_in_db = db.collection('ads')\
+                         .where(field_path='company', op_string='==', value=company_name)\
+                         .where(field_path='status', op_string='==', value='active').stream()
                          
     for doc in active_ads_in_db:
         if doc.id not in seen_hashes:
@@ -149,23 +150,24 @@ async def scrape_ads():
             await page.goto(url)
             await page.wait_for_timeout(7000) 
             
-            # Extract parent structural containers to keep descriptions tied to launch dates
-            card_containers = await page.query_selector_all('div[class*="_997a"]')
-            if not card_containers:
-                # Fallback layout parsing if Meta adjusts target wrapper labels
-                card_containers = await page.query_selector_all('div[class*="status-card"]')
+            # Select by fixed pre-wrap layout style attributes
+            elements = await page.query_selector_all('div[style*="white-space: pre-wrap;"]')
             
             processed_cards = []
-            for container in card_containers:
-                text_elem = await container.query_selector('div[style*="white-space: pre-wrap;"]')
-                if text_elem:
-                    text_content = await text_elem.inner_text()
-                    full_card_text = await container.inner_text()
-                    # Capture the date context from the upper text fragment
-                    header_context = full_card_text.split(text_content)[0] if text_content in full_card_text else full_card_text[:200]
+            for element in elements:
+                text_content = await element.inner_text()
+                if len(text_content) >= 40:
+                    # Traverses parent DOM elements up to 5 layers deep to grab metadata text
+                    full_card_text = await page.evaluate('''(el) => {
+                        let p = el.parentElement;
+                        for(let i=0; i<5 && p; i++) {
+                            if(p.innerText.includes("Started running on")) return p.innerText;
+                            p = p.parentElement;
+                        }
+                        return el.parentElement ? el.parentElement.innerText : "";
+                    }''', element)
                     
-                    if len(text_content) >= 40:
-                        processed_cards.append({"text": text_content, "header": header_context})
+                    processed_cards.append({"text": text_content, "header": full_card_text})
             
             print(f"Collected {len(processed_cards)} raw matching entries for {target['name']}.")
             seen_hashes = await process_live_ad_elements(target["name"], target["id"], processed_cards, url)
