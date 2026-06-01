@@ -1,0 +1,6 @@
+playwright
+firebase-admin
+google-genai
+requests
+gspread
+google-auth
